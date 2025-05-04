@@ -1,14 +1,13 @@
 import pandas as pd
 import numpy as np
-from scipy.stats import chi2
 import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime, timedelta
+from matplotlib.widgets import CheckButtons
 
-def detect_stress_test_outliers(df, sensitivity_columns, stress_test_column='stress_test', 
-                               date_column='date', decay_factor=0.05, confidence_level=0.99):
+def plot_sensitivities_interactive(df, sensitivity_columns, date_column='date', 
+                                   stress_test_column='stress_test',
+                                   client_category=None, client_category_column=None):
     """
-    Detect outliers in stress test figures using Mahalanobis Distance with time decay.
+    Create an interactive plot with checkboxes to toggle visibility of sensitivity lines.
     
     Parameters:
     -----------
@@ -16,236 +15,161 @@ def detect_stress_test_outliers(df, sensitivity_columns, stress_test_column='str
         DataFrame containing dates, stress test figures, and sensitivity measures
     sensitivity_columns : list
         List of column names containing sensitivity measures
-    stress_test_column : str
-        Column name for stress test figures
     date_column : str
         Column name for date
-    decay_factor : float
-        Controls how quickly the importance of past observations decays (higher = faster decay)
-    confidence_level : float
-        Confidence level for outlier detection (e.g., 0.95, 0.99)
-        
-    Returns:
-    --------
-    result_df : pandas DataFrame
-        DataFrame with original data plus Mahalanobis distances and outlier flags
-    """
-    # Ensure the dataframe is sorted by date
-    df = df.sort_values(by=date_column).reset_index(drop=True)
-    
-    # Convert date column to datetime if it's not already
-    if not pd.api.types.is_datetime64_any_dtype(df[date_column]):
-        df[date_column] = pd.to_datetime(df[date_column])
-    
-    # Calculate time differences in days from the latest date
-    latest_date = df[date_column].max()
-    df['days_from_latest'] = (latest_date - df[date_column]).dt.days
-    
-    # Calculate time weights with exponential decay
-    df['time_weight'] = np.exp(-decay_factor * df['days_from_latest'])
-    
-    # Normalize weights to sum to 1
-    df['time_weight'] = df['time_weight'] / df['time_weight'].sum()
-    
-    # Initialize columns for Mahalanobis distances
-    df['mahalanobis_distance'] = np.nan
-    
-    # For each row, calculate Mahalanobis distance using data up to that point
-    for i in range(len(df)):
-        if i < len(sensitivity_columns) + 1:  # Need at least n+1 observations for n variables
-            continue
-            
-        # Get historical data up to current row
-        hist_data = df.iloc[:i+1].copy()
-        
-        # Extract current row sensitivities
-        current_sensitivities = hist_data.iloc[-1][sensitivity_columns].values.reshape(1, -1)
-        
-        # Calculate weighted mean vector (excluding current observation)
-        weights_excluding_current = hist_data.iloc[:-1]['time_weight'].values
-        weights_excluding_current = weights_excluding_current / weights_excluding_current.sum()
-        
-        weighted_mean = np.average(
-            hist_data.iloc[:-1][sensitivity_columns].values, 
-            axis=0, 
-            weights=weights_excluding_current
-        )
-        
-        # Calculate weighted covariance matrix (excluding current observation)
-        # Using numpy's cov with weights
-        X = hist_data.iloc[:-1][sensitivity_columns].values
-        w = weights_excluding_current.reshape(-1, 1)  # Reshape for broadcasting
-        X_centered = X - weighted_mean
-        weighted_cov = np.dot(X_centered.T * w.T, X_centered) / (1 - (w**2).sum())
-        
-        # Add small regularization to ensure invertibility
-        weighted_cov += np.eye(len(sensitivity_columns)) * 1e-6
-        
-        try:
-            # Calculate inverse of covariance matrix
-            inv_cov = np.linalg.inv(weighted_cov)
-            
-            # Calculate Mahalanobis distance
-            diff = current_sensitivities - weighted_mean
-            mahalanobis_sq = np.dot(np.dot(diff, inv_cov), diff.T)[0, 0]
-            df.loc[i, 'mahalanobis_distance'] = np.sqrt(mahalanobis_sq)
-        except np.linalg.LinAlgError:
-            # If matrix inversion fails, set distance to NaN
-            df.loc[i, 'mahalanobis_distance'] = np.nan
-    
-    # Calculate threshold based on chi-squared distribution
-    dof = len(sensitivity_columns)  # degrees of freedom = number of variables
-    threshold = np.sqrt(chi2.ppf(confidence_level, dof))
-    
-    # Flag outliers
-    df['is_outlier'] = df['mahalanobis_distance'] > threshold
-    
-    # Add calculated threshold for reference
-    df['threshold'] = threshold
-    
-    return df
-
-def analyze_latest_stress_test(df, sensitivity_columns, stress_test_column='stress_test',
-                              date_column='date', decay_factor=0.05, confidence_level=0.99,
-                              client_category_column=None, show_plot=True):
-    """
-    Analyze if the latest stress test figure is an outlier, with optional grouping by client category.
-    
-    Parameters:
-    -----------
-    df : pandas DataFrame
-        DataFrame containing dates, stress test figures, and sensitivity measures
-    sensitivity_columns : list
-        List of column names containing sensitivity measures
     stress_test_column : str
         Column name for stress test figures
-    date_column : str
-        Column name for date
-    decay_factor : float
-        Controls how quickly the importance of past observations decays (higher = faster decay)
-    confidence_level : float
-        Confidence level for outlier detection (e.g., 0.95, 0.99)
+    client_category : str or None
+        If provided, filter data to this specific category
     client_category_column : str or None
-        If provided, analysis will be done separately for each client category
-    show_plot : bool
-        Whether to display plots of the results
-        
-    Returns:
-    --------
-    dict : Dictionary of results for each client category (or 'all' if no category provided)
+        Column name for client category if applicable
     """
-    results = {}
-    
-    if client_category_column is not None:
-        # Analyze separately for each client category
-        for category, group_df in df.groupby(client_category_column):
-            print(f"\nAnalyzing client category: {category}")
-            result_df = detect_stress_test_outliers(
-                group_df, sensitivity_columns, stress_test_column, 
-                date_column, decay_factor, confidence_level
-            )
-            
-            # Store results
-            results[category] = result_df
-            
-            # Check if latest observation is an outlier
-            latest_row = result_df.iloc[-1]
-            is_outlier = latest_row['is_outlier']
-            distance = latest_row['mahalanobis_distance']
-            threshold = latest_row['threshold']
-            
-            print(f"Latest stress test figure ({latest_row[stress_test_column]}) for {category}:")
-            print(f"Date: {latest_row[date_column]}")
-            print(f"Mahalanobis distance: {distance:.4f}")
-            print(f"Threshold at {confidence_level*100}% confidence: {threshold:.4f}")
-            print(f"Outlier status: {'OUTLIER' if is_outlier else 'Normal'}")
-            
-            if show_plot:
-                plot_results(result_df, date_column, stress_test_column, category)
+    # Filter by category if specified
+    if client_category is not None and client_category_column is not None:
+        plot_df = df[df[client_category_column] == client_category].copy()
+        title_suffix = f" - {client_category}"
     else:
-        # Analyze entire dataset
-        result_df = detect_stress_test_outliers(
-            df, sensitivity_columns, stress_test_column, 
-            date_column, decay_factor, confidence_level
-        )
-        
-        # Store results
-        results['all'] = result_df
-        
-        # Check if latest observation is an outlier
-        latest_row = result_df.iloc[-1]
-        is_outlier = latest_row['is_outlier']
-        distance = latest_row['mahalanobis_distance']
-        threshold = latest_row['threshold']
-        
-        print(f"\nLatest stress test figure ({latest_row[stress_test_column]}):")
-        print(f"Date: {latest_row[date_column]}")
-        print(f"Mahalanobis distance: {distance:.4f}")
-        print(f"Threshold at {confidence_level*100}% confidence: {threshold:.4f}")
-        print(f"Outlier status: {'OUTLIER' if is_outlier else 'Normal'}")
-        
-        if show_plot:
-            plot_results(result_df, date_column, stress_test_column)
+        plot_df = df.copy()
+        title_suffix = ""
     
-    return results
+    # Set up the figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [1, 2]})
+    fig.suptitle(f"Stress Test and Sensitivity Analysis{title_suffix}", fontsize=16)
+    
+    # Plot stress test values in top subplot
+    ax1.plot(plot_df[date_column], plot_df[stress_test_column], 
+             marker='o', linestyle='-', color='black', label='Stress Test')
+    
+    # Add outliers if available
+    if 'is_outlier' in plot_df.columns:
+        outliers = plot_df[plot_df['is_outlier']]
+        if not outliers.empty:
+            ax1.scatter(outliers[date_column], outliers[stress_test_column], 
+                        color='red', s=100, zorder=5, label='Outliers')
+    
+    ax1.set_ylabel('Stress Test Value')
+    ax1.set_title('Stress Test Values Over Time')
+    ax1.legend(loc='upper left')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot all sensitivities in bottom subplot
+    lines = []
+    for col in sensitivity_columns:
+        line, = ax2.plot(plot_df[date_column], plot_df[col], 
+                        marker='.', linestyle='-', label=col)
+        lines.append(line)
+    
+    ax2.set_xlabel('Date')
+    ax2.set_ylabel('Sensitivity Value')
+    ax2.set_title('Sensitivity Measures Over Time')
+    ax2.legend(loc='upper left')
+    ax2.grid(True, alpha=0.3)
+    
+    # Format x-axis dates
+    fig.autofmt_xdate()
+    
+    # Add checkboxes to toggle visibility of each sensitivity
+    plt.subplots_adjust(left=0.2)
+    
+    # Create a frame for the checkboxes (in figure coordinates)
+    rax = plt.axes([0.02, 0.4, 0.12, 0.15])
+    check = CheckButtons(
+        ax=rax,
+        labels=sensitivity_columns,
+        actives=[True] * len(sensitivity_columns)  # All sensitivities visible initially
+    )
+    
+    # Function to toggle line visibility
+    def toggle_visibility(label):
+        index = sensitivity_columns.index(label)
+        lines[index].set_visible(not lines[index].get_visible())
+        fig.canvas.draw_idle()
+    
+    # Connect the callback
+    check.on_clicked(toggle_visibility)
+    
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.9, left=0.2)
+    
+    return fig, ax1, ax2
 
-def plot_results(df, date_column, stress_test_column, category=None):
+# Add simplified version for non-interactive environments
+def plot_sensitivities_simple(df, sensitivity_columns, date_column='date', 
+                             stress_test_column='stress_test',
+                             selected_sensitivities=None,
+                             client_category=None, client_category_column=None):
     """
-    Plot the results of the outlier detection.
+    Plot stress test and selected sensitivities without interactive features.
     
     Parameters:
     -----------
     df : pandas DataFrame
-        DataFrame with calculated Mahalanobis distances and outlier flags
+        DataFrame containing dates, stress test figures, and sensitivity measures
+    sensitivity_columns : list
+        List of column names containing sensitivity measures
     date_column : str
         Column name for date
     stress_test_column : str
         Column name for stress test figures
-    category : str or None
-        Client category if applicable
+    selected_sensitivities : list or None
+        List of sensitivity columns to plot. If None, all sensitivities are plotted.
+    client_category : str or None
+        If provided, filter data to this specific category
+    client_category_column : str or None
+        Column name for client category if applicable
     """
-    # Set up the figure
-    fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    # Default to all sensitivities if none specified
+    if selected_sensitivities is None:
+        selected_sensitivities = sensitivity_columns
     
-    # Title with category if provided
-    title_suffix = f" for {category}" if category else ""
-    fig.suptitle(f"Stress Test Outlier Analysis{title_suffix}", fontsize=16)
+    # Filter by category if specified
+    if client_category is not None and client_category_column is not None:
+        plot_df = df[df[client_category_column] == client_category].copy()
+        title_suffix = f" - {client_category}"
+    else:
+        plot_df = df.copy()
+        title_suffix = ""
     
-    # Plot 1: Stress test values over time
-    axes[0].plot(df[date_column], df[stress_test_column], marker='o', linestyle='-', label='Stress Test Value')
+    # Set up the figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    fig.suptitle(f"Stress Test and Sensitivity Analysis{title_suffix}", fontsize=16)
     
-    # Highlight outliers in red
-    outliers = df[df['is_outlier']]
-    if not outliers.empty:
-        axes[0].scatter(outliers[date_column], outliers[stress_test_column], 
-                       color='red', s=100, zorder=5, label='Outliers')
+    # Plot stress test values in top subplot
+    ax1.plot(plot_df[date_column], plot_df[stress_test_column], 
+             marker='o', linestyle='-', color='black', label='Stress Test')
     
-    axes[0].set_ylabel('Stress Test Value')
-    axes[0].set_title('Stress Test Values Over Time')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+    # Add outliers if available
+    if 'is_outlier' in plot_df.columns:
+        outliers = plot_df[plot_df['is_outlier']]
+        if not outliers.empty:
+            ax1.scatter(outliers[date_column], outliers[stress_test_column], 
+                        color='red', s=100, zorder=5, label='Outliers')
     
-    # Plot 2: Mahalanobis distances over time with threshold
-    axes[1].plot(df[date_column], df['mahalanobis_distance'], marker='o', linestyle='-', label='Mahalanobis Distance')
-    axes[1].axhline(y=df['threshold'].iloc[-1], color='r', linestyle='--', label=f"Threshold ({df['threshold'].iloc[-1]:.2f})")
+    ax1.set_ylabel('Stress Test Value')
+    ax1.set_title('Stress Test Values Over Time')
+    ax1.legend(loc='upper left')
+    ax1.grid(True, alpha=0.3)
     
-    axes[1].set_xlabel('Date')
-    axes[1].set_ylabel('Mahalanobis Distance')
-    axes[1].set_title('Mahalanobis Distances Over Time')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
+    # Plot selected sensitivities in bottom subplot
+    for col in selected_sensitivities:
+        ax2.plot(plot_df[date_column], plot_df[col], 
+                marker='.', linestyle='-', label=col)
+    
+    ax2.set_xlabel('Date')
+    ax2.set_ylabel('Sensitivity Value')
+    ax2.set_title(f'Selected Sensitivity Measures Over Time')
+    ax2.legend(loc='upper left')
+    ax2.grid(True, alpha=0.3)
     
     # Format x-axis dates
     fig.autofmt_xdate()
     
     plt.tight_layout()
-    plt.subplots_adjust(top=0.9)
-    plt.show()
-
-# Example usage:
-if __name__ == "__main__":
-    # This is a synthetic example - replace with your actual data
     
+    return fig, ax1, ax2
+
+# Example usage
+if __name__ == "__main__":
     # Create synthetic data
     np.random.seed(42)
     dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
@@ -254,9 +178,11 @@ if __name__ == "__main__":
     sensi_1 = np.random.normal(100, 20, 100) + np.linspace(0, 50, 100)  # With upward trend
     sensi_2 = np.random.normal(50, 10, 100) + np.sin(np.linspace(0, 4*np.pi, 100)) * 20  # With cyclical pattern
     sensi_3 = np.random.normal(200, 30, 100)  # Random fluctuation
+    sensi_4 = np.random.normal(75, 15, 100) + np.cos(np.linspace(0, 3*np.pi, 100)) * 25  # Another cyclical pattern
+    sensi_5 = np.random.normal(150, 25, 100) - np.linspace(0, 30, 100)  # With downward trend
     
     # Create stress test values with relationship to sensitivities plus noise
-    stress_test = 0.5 * sensi_1 + 0.3 * sensi_2 + 0.2 * sensi_3 + np.random.normal(0, 50, 100)
+    stress_test = 0.3 * sensi_1 + 0.2 * sensi_2 + 0.15 * sensi_3 + 0.25 * sensi_4 + 0.1 * sensi_5 + np.random.normal(0, 40, 100)
     
     # Introduce an anomaly in the last observation
     stress_test[-1] = stress_test[-1] * 1.5  # Increase the last value by 50%
@@ -271,26 +197,43 @@ if __name__ == "__main__":
         'stress_test': stress_test,
         'sensitivity_1': sensi_1,
         'sensitivity_2': sensi_2,
-        'sensitivity_3': sensi_3
+        'sensitivity_3': sensi_3,
+        'sensitivity_4': sensi_4,
+        'sensitivity_5': sensi_5
     })
     
     # Define sensitivity columns
-    sensitivity_columns = ['sensitivity_1', 'sensitivity_2', 'sensitivity_3']
+    sensitivity_columns = ['sensitivity_1', 'sensitivity_2', 'sensitivity_3', 'sensitivity_4', 'sensitivity_5']
     
-    # Analyze without client categories
-    results = analyze_latest_stress_test(
+    # Create interactive plot
+    print("Creating interactive plot with checkboxes to toggle sensitivities...")
+    fig, _, _ = plot_sensitivities_interactive(
         df, 
         sensitivity_columns, 
-        stress_test_column='stress_test',
         date_column='date',
-        decay_factor=0.03,  # Lower value gives slower decay (more weight to history)
-        confidence_level=0.99,
-        client_category_column=None,  # Remove None to analyze by client category
-        show_plot=True
+        stress_test_column='stress_test'
     )
+    plt.show()
     
-    # Access the results for further analysis if needed
-    # full_results = results['all']  # When not using client categories
-    # or when using client categories:
-    # high_risk_results = results['High Risk']
-    # low_risk_results = results['Low Risk']
+    # Create non-interactive plot with selected sensitivities
+    print("\nCreating non-interactive plot with selected sensitivities...")
+    fig, _, _ = plot_sensitivities_simple(
+        df, 
+        sensitivity_columns, 
+        date_column='date',
+        stress_test_column='stress_test',
+        selected_sensitivities=['sensitivity_1', 'sensitivity_3', 'sensitivity_5']  # Only show these
+    )
+    plt.show()
+    
+    # Example with client category filter
+    print("\nCreating plot filtered by client category...")
+    fig, _, _ = plot_sensitivities_simple(
+        df, 
+        sensitivity_columns, 
+        date_column='date',
+        stress_test_column='stress_test',
+        client_category='High Risk',
+        client_category_column='client_category'
+    )
+    plt.show()
